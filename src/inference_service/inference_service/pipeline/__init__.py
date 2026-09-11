@@ -39,6 +39,7 @@ from inference_service.pipeline.smolvla import (
     load_smolvla_policy_config,
     validate_smolvla_plan,
 )
+from inference_service.pipeline.staged_executor import StagedModelExecutor, StagedScheduling
 from inference_service.pipeline.stages import (
     DirectIterationStateAdapter,
     EulerIterationStateAdapter,
@@ -103,6 +104,8 @@ __all__ = [
     "Processor",
     "ResultAdapter",
     "StageFrame",
+    "StagedModelExecutor",
+    "StagedScheduling",
     "validate_action_output",
     "create_inference_pipeline",
     "create_pi05_executor",

@@ -641,19 +641,17 @@ def launch_setup(context, *args, **kwargs):
             if sim_platform == "mujoco" and scene_name == "pick_banana":
                 from launch_ros.actions import Node as LaunchNode  # noqa: PLC0415
 
-                restart_service = "/action_dispatcher/restart_session" if scheduler_enabled else ""
-
                 actions.append(
                     LaunchNode(
                         package="sim_models",
                         executable="pick_banana_task_node",
                         name="pick_banana_task_node",
                         parameters=[
-                            {
-                                "use_sim_time": True,
-                                "restart_session_service": restart_service,
-                            }
+                            {"use_sim_time": True}
+                            if scheduler_enabled
+                            else {"use_sim_time": True, "restart_session_service": ""}
                         ],
+                        arguments=["--scheduled-dispatch"] if scheduler_enabled else [],
                         output="screen",
                     )
                 )

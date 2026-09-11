@@ -3,6 +3,12 @@
 `inference_manifest` 定义 IB-Robot 推理 bundle 的硬件无关 schema v3 契约。加载器只接受
 schema version 3，不翻译旧身份或旧 runtime 别名。
 
+Ascend 独立分阶段执行使用 `functional_execution` 声明异步、隔离、发布和优先级能力。
+该能力要求 `deployment.execution` 恰好有两个角色，按顺序推导 producer 和 terminal；
+不再重复接受 `functional_execution.stages`、`role` 或 `depends_on` 拓扑字段。
+已有实验 manifest 需要删除冗余的 `functional_execution.stages`，机器人配置的
+`scheduling.stages` 仍可按 `execution` 中的角色设置阶段优先级。
+
 ## Schema v3
 
 调度身份永远是 `interface`、`model_type`、`operation` 三元组。Policy 使用

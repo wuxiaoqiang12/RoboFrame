@@ -297,6 +297,29 @@
         "lifetime": {"const": "inference"}
       }
     },
+    "functional_execution_capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "supports_async_stage_submission",
+        "per_model_dataset_isolation", "per_model_output_isolation",
+        "atomic_latest_result_publish", "immutable_result_publish",
+        "result_version_fence", "intermediate_buffer_isolation",
+        "supports_priority_streams"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "supports_async_stage_submission": {"const": true},
+        "per_model_dataset_isolation": {"const": true},
+        "per_model_output_isolation": {"const": true},
+        "atomic_latest_result_publish": {"const": true},
+        "immutable_result_publish": {"const": true},
+        "result_version_fence": {"const": true},
+        "intermediate_buffer_isolation": {"const": true},
+        "supports_priority_streams": {"const": true},
+        "max_concurrent_executions_per_model_instance": {"const": 1, "default": 1}
+      }
+    },
     "deployment": {
       "type": "object",
       "additionalProperties": false,
@@ -335,6 +358,7 @@
           "additionalProperties": {"$ref": "#/$defs/artifact_bindings"}
         },
         "device_links": {"type": "array", "items": {"$ref": "#/$defs/device_link"}},
+        "functional_execution": {"$ref": "#/$defs/functional_execution_capability"},
         "metadata": {"type": "object"}
       }
     }

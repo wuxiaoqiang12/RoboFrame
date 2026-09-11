@@ -45,10 +45,11 @@ from sim_models.aruco_spawner import (
 
 ### `pick_banana_task_node`
 
-MuJoCo `pick_banana` 场景任务由 `robot.launch.py` 启动。`restart_session_service` 参数由 launch graph
-显式设置：scheduler 缺失/false 时为空，任务继续使用 legacy dispatcher reset；scheduler true 时为
-`/action_dispatcher/restart_session`，场景重置必须先 safe-stop 并 Close 旧 product session。节点不通过
+MuJoCo `pick_banana` 场景任务由 `robot.launch.py` 启动。`--scheduled-dispatch` 应用参数由 launch graph
+显式设置：scheduler 缺失/false 时不传，任务继续使用 legacy dispatcher reset；scheduler true 时传入该 flag，
+场景重置必须先 safe-stop 并 Close 旧 product session。节点不通过
 service presence 自动判断调度模式，避免 false 分支因残留服务改变行为。
+旧启动脚本使用的 `restart_session_service` ROS 参数继续受支持，仅作为显式的 scheduled 模式选择，不做服务探测。
 
 ## 与其他包的关系
 

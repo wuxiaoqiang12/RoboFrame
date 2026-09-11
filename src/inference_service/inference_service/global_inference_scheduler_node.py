@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -18,7 +19,10 @@ from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import (
     CloseInferenceSession,
+    ClosePipelineBinding,
+    DispatchPipelineBinding,
     OpenInferenceSession,
+    OpenPipelineBinding,
     ScheduledDispatchInfer,
 )
 from ibrobot_msgs.msg import InferenceOutcome, InferenceServingStatus
@@ -50,6 +54,12 @@ from inference_service.scheduler.ledger import (
     close_key,
     dispatch_key,
     open_key,
+)
+from inference_service.scheduler.operations import (
+    Certainty,
+    OperationIdentity,
+    OperationKind,
+    OperationRegistry,
 )
 from inference_service.scheduler.profiles import ProfileError, ProfileRegistry
 from inference_service.scheduler.result_identity import result_identity_error
@@ -119,7 +129,11 @@ class GlobalInferenceSchedulerNode(Node):
         self._status_lock = threading.RLock()
         self._serving_status: dict[str, _ObservedStatus] = {}
         self._trusted_status_cursors: dict[str, tuple[str, int]] = {}
-        self._deadline_reservations = DeadlineReservationTable()
+        self._deadline_reservations = DeadlineReservationTable(policy=self._global_policy)
+        self._downstream_operations = OperationRegistry(
+            max_records=self._max_session_records * (self._terminal_result_cache_entries + 4),
+            max_waiters_per_operation=self._max_duplicate_waiters,
+        )
         self._client_group = ReentrantCallbackGroup()
         self._pipeline_clients = self._create_pipeline_clients()
         self._profile_registries, self._profile_errors = self._load_profile_registries()
@@ -197,6 +211,7 @@ class GlobalInferenceSchedulerNode(Node):
             ("close_session_endpoint", "/inference/session/close"),
             ("default_target_pipeline_id", ""),
             ("pipelines_json", "[]"),
+            ("global_policy", "fifo"),
         )
         for name, default in string_parameters:
             self.declare_parameter(name, default)
@@ -226,12 +241,21 @@ class GlobalInferenceSchedulerNode(Node):
             self.declare_parameter(name, 0)
         self.declare_parameter("dispatch_goal_contexts", 4)
         self.declare_parameter("lower_priority_dispatch_goal_contexts", 2)
+        self.declare_parameter("priority_zero_deadline_admission_enabled", False)
+        self.declare_parameter("priority_zero_deadline_admission_safety_margin_ms", 5)
         self._readiness_endpoint = str(self.get_parameter("readiness_endpoint").value)
         self._open_endpoint_name = str(self.get_parameter("open_session_endpoint").value)
         self._dispatch_endpoint_name = str(self.get_parameter("dispatch_endpoint").value)
         self._close_endpoint_name = str(self.get_parameter("close_session_endpoint").value)
         self._default_target_pipeline_id = str(self.get_parameter("default_target_pipeline_id").value)
         self._pipelines_json = str(self.get_parameter("pipelines_json").value)
+        self._global_policy = str(self.get_parameter("global_policy").value)
+        self._priority_zero_deadline_admission_enabled = bool(
+            self.get_parameter("priority_zero_deadline_admission_enabled").value
+        )
+        self._priority_zero_deadline_admission_safety_margin_ms = int(
+            self.get_parameter("priority_zero_deadline_admission_safety_margin_ms").value
+        )
         self._default_open_timeout_ns = int(self.get_parameter("default_open_timeout_ns").value)
         self._default_request_timeout_ns = int(self.get_parameter("default_request_timeout_ns").value)
         self._status_stale_timeout_ns = int(self.get_parameter("status_stale_timeout_ns").value)
@@ -312,13 +336,13 @@ class GlobalInferenceSchedulerNode(Node):
         return {
             candidate.pipeline_id: {
                 "open": rclpy.action.ActionClient(
-                    self, OpenInferenceSession, candidate.endpoint_open, callback_group=self._client_group
+                    self, OpenPipelineBinding, candidate.endpoint_open, callback_group=self._client_group
                 ),
                 "dispatch": rclpy.action.ActionClient(
-                    self, ScheduledDispatchInfer, candidate.endpoint_dispatch, callback_group=self._client_group
+                    self, DispatchPipelineBinding, candidate.endpoint_dispatch, callback_group=self._client_group
                 ),
                 "close": rclpy.action.ActionClient(
-                    self, CloseInferenceSession, candidate.endpoint_close, callback_group=self._client_group
+                    self, ClosePipelineBinding, candidate.endpoint_close, callback_group=self._client_group
                 ),
             }
             for candidate in self._candidates
@@ -375,8 +399,9 @@ class GlobalInferenceSchedulerNode(Node):
                 if reason:
                     return
                 if previous_cursor is not None and message.boot_id != previous_cursor[0]:
-                    self._core.reconcile_pipeline_boot(pipeline_id)
+                    self._core.reconcile_pipeline_boot(pipeline_id, boot_id=message.boot_id)
                     self._deadline_reservations.reconcile_pipeline(pipeline_id)
+                    self._downstream_operations.fence_boot(previous_cursor[0])
                 self._trusted_status_cursors[pipeline_id] = (message.boot_id, int(message.sequence))
 
         return _callback
@@ -423,10 +448,34 @@ class GlobalInferenceSchedulerNode(Node):
             return "configured_hardware_resource_mismatch"
         if message.runtime_hardware_resource_id != candidate.hardware_resource_id:
             return "runtime_hardware_resource_mismatch"
-        if message.hardware_priority_levels < 1:
+        if message.hardware_priority_levels not in {1, 8}:
             return "hardware_priority_levels_invalid"
+        schema_version = int(message.scheduling_capability_schema_version)
+        if schema_version not in {0, 1}:
+            return "scheduling_capability_schema_mismatch"
+        if schema_version == 1 and message.stage_policy not in {"SEQUENTIAL", "INDEPENDENT"}:
+            return "stage_policy_invalid"
+        if schema_version == 1 and not message.functional_capability_fingerprint:
+            return "functional_capability_fingerprint_missing"
+        if (
+            schema_version == 1
+            and message.stage_policy == "INDEPENDENT"
+            and message.supports_priority_zero_deadline_admission
+        ):
+            # Independent stages cannot honor deadline-driven priority-0
+            # ordering; a publisher claiming both is inconsistent.
+            return "priority_zero_deadline_admission_capability_invalid"
+        if message.max_supported_public_priority < 0 or message.max_supported_public_priority > 7:
+            return "max_supported_public_priority_invalid"
+        expected_mask = (1 << (int(message.max_supported_public_priority) + 1)) - 1
+        if schema_version == 1 and int(message.accepted_public_priority_mask) != expected_mask:
+            return "accepted_public_priority_mask_invalid"
         if required_priority is not None and required_priority >= message.hardware_priority_levels:
             return "unsupported_default_priority"
+        if required_priority is not None and not (
+            int(message.accepted_public_priority_mask) & (1 << required_priority)
+        ):
+            return "unsupported_public_priority"
         expected = candidate.public_capacity or {}
         actual: dict[str, int] = {}
         for capacity in message.capacities:
@@ -530,6 +579,7 @@ class GlobalInferenceSchedulerNode(Node):
         client,
         goal,
         *,
+        operation_kind: OperationKind,
         deadline_monotonic_ns: int,
         upstream_goal_handle=None,
         late_acceptance_callback=None,
@@ -545,11 +595,62 @@ class GlobalInferenceSchedulerNode(Node):
             return _DownstreamCall("not_started", reason=reason)
         if deadline_monotonic_ns <= time.monotonic_ns():
             return _DownstreamCall("not_started", reason="deadline_exceeded")
+        operation_id = str(getattr(goal, "operation_id", ""))
+        if not operation_id:
+            return _DownstreamCall("unknown", reason="downstream_operation_id_missing")
+        waiter_id = str(uuid.uuid4())
+        downstream_operations = self._downstream_operations
+        try:
+            operation, created = downstream_operations.create_or_get(
+                kind=operation_kind,
+                idempotency_key=(operation_kind.value, operation_id),
+                identity=OperationIdentity(
+                    str(goal.session_id),
+                    max(1, int(getattr(goal, "logical_generation", 1))),
+                    str(getattr(goal, "binding_id", "")),
+                    max(1, int(getattr(goal, "binding_incarnation", 1))),
+                    str(getattr(goal, "expected_boot_id", "")),
+                ),
+                deadline_mono_ns=deadline_monotonic_ns,
+                waiter_id=waiter_id,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return _DownstreamCall("unknown", reason=f"downstream_operation_identity_invalid:{exc}")
+        if not created:
+            if operation.wait(max(0.0, (deadline_monotonic_ns - time.monotonic_ns()) / 1_000_000_000)):
+                call = self._operation_result(operation)
+                downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
+                return call
+            downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
+            return _DownstreamCall("unknown", reason="downstream_result_timeout")
+        operation.claim_send()
         send_done = threading.Event()
         holder: dict[str, object] = {}
         acceptance_timed_out = False
         late_cleanup_sent = False
         acceptance_state_lock = threading.Lock()
+        result_done = threading.Event()
+
+        def _result(future) -> None:
+            try:
+                holder["result"] = future.result().result
+            except Exception as exc:  # noqa: BLE001
+                holder["result_error"] = exc
+                downstream_operations.finish(operation.operation_id, certainty=Certainty.UNKNOWN, error=str(exc))
+            else:
+                result = holder["result"]
+                outcome = int(result.outcome.value)
+                certainty = {
+                    InferenceOutcome.NOT_STARTED: Certainty.NOT_STARTED,
+                    InferenceOutcome.COMPLETED: Certainty.COMPLETED,
+                }.get(outcome, Certainty.UNKNOWN)
+                downstream_operations.finish(
+                    operation.operation_id,
+                    certainty=certainty,
+                    result=result,
+                    error=str(result.error.code),
+                )
+            result_done.set()
 
         def _run_late_cleanup() -> None:
             nonlocal late_cleanup_sent
@@ -573,11 +674,29 @@ class GlobalInferenceSchedulerNode(Node):
             except Exception as exc:  # noqa: BLE001
                 holder["error"] = exc
             _run_late_cleanup()
+            goal_handle = holder.get("goal_handle")
+            if "error" in holder:
+                downstream_operations.finish(
+                    operation.operation_id, certainty=Certainty.UNKNOWN, error=str(holder["error"])
+                )
+            elif goal_handle is None or not getattr(goal_handle, "accepted", False):
+                downstream_operations.finish(
+                    operation.operation_id, certainty=Certainty.NOT_STARTED, error="goal_rejected"
+                )
+            else:
+                try:
+                    goal_handle.get_result_async().add_done_callback(_result)
+                except Exception as exc:  # noqa: BLE001
+                    holder["result_error"] = exc
+                    downstream_operations.finish(operation.operation_id, certainty=Certainty.UNKNOWN, error=str(exc))
+                    result_done.set()
             send_done.set()
 
         try:
             client.send_goal_async(goal).add_done_callback(_sent)
         except Exception as exc:  # noqa: BLE001
+            downstream_operations.finish(operation.operation_id, certainty=Certainty.NOT_STARTED, error=str(exc))
+            downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
             return _DownstreamCall("not_started", reason=str(exc))
         acceptance_timeout = min(
             self._goal_acceptance_timeout_ns,
@@ -593,11 +712,17 @@ class GlobalInferenceSchedulerNode(Node):
                 with acceptance_state_lock:
                     acceptance_timed_out = True
                 _run_late_cleanup()
+                downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
                 return _DownstreamCall("unknown", reason="goal_acceptance_timeout")
         if "error" in holder:
+            downstream_operations.finish(
+                operation.operation_id, certainty=Certainty.UNKNOWN, error=str(holder["error"])
+            )
+            downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
             return _DownstreamCall("unknown", reason=str(holder["error"]))
         goal_handle = holder.get("goal_handle")
         if goal_handle is None or not goal_handle.accepted:
+            downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
             return _DownstreamCall("not_started", reason="goal_rejected")
 
         cancel_sent = False
@@ -613,60 +738,61 @@ class GlobalInferenceSchedulerNode(Node):
         if cancel_requested or (upstream_goal_handle is not None and upstream_goal_handle.is_cancel_requested):
             request_downstream_cancel()
 
-        result_done = threading.Event()
-
-        def _result(future) -> None:
-            try:
-                holder["result"] = future.result().result
-            except Exception as exc:  # noqa: BLE001
-                holder["result_error"] = exc
-            result_done.set()
-
-        goal_handle.get_result_async().add_done_callback(_result)
         while not result_done.wait(0.05):
             if upstream_goal_handle is not None and upstream_goal_handle.is_cancel_requested:
                 request_downstream_cancel()
             if time.monotonic_ns() >= deadline_monotonic_ns:
+                downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
                 return _DownstreamCall("unknown", reason="downstream_result_timeout")
         if "result_error" in holder:
+            downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
             return _DownstreamCall("unknown", reason=str(holder["result_error"]))
-        result = holder["result"]
-        outcome = int(result.outcome.value)
-        if outcome == InferenceOutcome.UNKNOWN:
-            return _DownstreamCall("unknown", result=result, reason=result.error.code)
-        if outcome == InferenceOutcome.NOT_STARTED:
-            return _DownstreamCall("not_started", result=result, reason=result.error.code)
-        if outcome != InferenceOutcome.COMPLETED:
-            return _DownstreamCall("unknown", result=result, reason="invalid_downstream_outcome")
-        return _DownstreamCall("completed", result=result)
+        call = self._operation_result(operation)
+        downstream_operations.detach_waiter(operation.operation_id, waiter_id, time.monotonic_ns())
+        return call
+
+    @staticmethod
+    def _operation_result(operation) -> _DownstreamCall:
+        result = operation.result
+        if operation.certainty is Certainty.NOT_STARTED:
+            return _DownstreamCall("not_started", result=result, reason=operation.error)
+        if operation.certainty is Certainty.COMPLETED:
+            return _DownstreamCall("completed", result=result)
+        return _DownstreamCall("unknown", result=result, reason=operation.error or "downstream_outcome_unknown")
 
     @staticmethod
     def _validate_downstream_result(action: str, goal, result, candidate: PipelineCandidate) -> str:
-        expected: dict[str, object] = {"session_id": goal.session_id}
+        expected: dict[str, object] = {
+            "session_id": goal.session_id,
+            "logical_generation": goal.logical_generation,
+            "binding_id": goal.binding_id,
+            "binding_incarnation": goal.binding_incarnation,
+            "operation_id": goal.operation_id,
+            "boot_id": goal.expected_boot_id,
+        }
         require_higher_drained_generation = False
         if action == "open":
             if result.success:
                 expected.update(
-                    actual_pipeline_id=candidate.pipeline_id,
+                    pipeline_id=candidate.pipeline_id,
                     deployment_fingerprint=candidate.deployment_fingerprint,
                     runtime_policy_fingerprint=candidate.runtime_policy_fingerprint,
                 )
-                if int(result.session_generation) <= 0:
-                    return "open_session_generation_invalid"
+                if int(result.pipeline_generation) <= 0:
+                    return "open_pipeline_generation_invalid"
         elif action == "dispatch":
             expected.update(
-                session_generation=goal.session_generation,
                 request_id=goal.request_id,
                 pipeline_id=candidate.pipeline_id,
                 deployment_fingerprint=candidate.deployment_fingerprint,
                 runtime_policy_fingerprint=candidate.runtime_policy_fingerprint,
             )
+            if int(goal.expected_pipeline_generation) > 0:
+                expected["pipeline_generation"] = goal.expected_pipeline_generation
         elif action == "close":
             expected["pipeline_id"] = candidate.pipeline_id
-            if int(result.outcome.value) == InferenceOutcome.COMPLETED:
-                if goal.session_generation > 0:
-                    expected["closed_session_generation"] = goal.session_generation
-                require_higher_drained_generation = bool(result.success)
+            if int(result.outcome.value) == InferenceOutcome.COMPLETED and goal.expected_pipeline_generation > 0:
+                expected["closed_pipeline_generation"] = goal.expected_pipeline_generation
         return result_identity_error(
             action,
             result,
@@ -913,6 +1039,20 @@ class GlobalInferenceSchedulerNode(Node):
 
     def _dispatch_once(self, goal_handle, _ledger_entry) -> ScheduledDispatchInfer.Result:
         goal = goal_handle.request
+        global_policy = getattr(self, "_global_policy", "fifo")
+        profile_admission = global_policy == "fifo" and getattr(self, "_priority_zero_deadline_admission_enabled", True)
+        priority_zero_scheduling = goal.priority == 0 and (global_policy == "edf" or profile_admission)
+        # Deadline-driven priority-0 routing is a sequential-only contract;
+        # both EDF ordering and FIFO profile admission require it.
+        if goal.fallback_chain and goal.priority == 0 and global_policy == "fifo" and not profile_admission:
+            return self._dispatch_not_started(
+                goal_handle,
+                goal,
+                goal.target_pipeline_id,
+                "fallback_not_supported_for_policy",
+                "",
+                recoverable=False,
+            )
         try:
             plan = self._core.resolve_dispatch_plan(
                 session_id=goal.session_id,
@@ -920,6 +1060,7 @@ class GlobalInferenceSchedulerNode(Node):
                 target_pipeline_id=goal.target_pipeline_id,
                 fallback_chain=list(goal.fallback_chain),
                 priority=goal.priority,
+                request_id=goal.request_id,
             )
         except SchedulerError as exc:
             return self._dispatch_not_started(goal_handle, goal, "", str(exc), "")
@@ -934,7 +1075,7 @@ class GlobalInferenceSchedulerNode(Node):
                 reservation: DeadlineReservation | None = None
                 last_pipeline_id = pipeline_id
                 candidate = self._candidate_by_id[pipeline_id]
-                reason = self._status_reason(candidate)
+                reason = self._status_reason(candidate, required_priority=goal.priority)
                 if not reason:
                     reason = self._compatibility_reason(target, candidate)
                 if reason:
@@ -942,17 +1083,51 @@ class GlobalInferenceSchedulerNode(Node):
                     last_recoverable = True
                     continue
                 try:
+                    observed = getattr(self, "_serving_status", {}).get(pipeline_id)
+                    expected_boot_id = observed.message.boot_id if observed is not None else None
                     binding = self._core.prepare_dispatch_candidate(
                         session_id=goal.session_id,
                         session_generation=goal.session_generation,
                         pipeline_id=pipeline_id,
+                        expected_boot_id=expected_boot_id,
                     )
                 except SchedulerError as exc:
                     return self._dispatch_not_started(goal_handle, goal, pipeline_id, str(exc), "")
                 if binding.pipeline_id is None:
-                    last_reason = binding.reason
+                    last_reason = getattr(binding, "reason", "pipeline_unavailable")
                     last_recoverable = True
                     continue
+                if getattr(binding, "reason", "") == "binding_open_in_progress":
+                    wait_for_open = getattr(self._core, "wait_for_binding_open", None)
+                    if not callable(wait_for_open) or not wait_for_open(
+                        session_id=goal.session_id,
+                        pipeline_id=pipeline_id,
+                        deadline_monotonic_ns=deadline_monotonic_ns,
+                    ):
+                        last_reason = "binding_open_timeout"
+                        last_detail = "another request is still opening the pipeline binding"
+                        last_recoverable = True
+                        continue
+                    observed = getattr(self, "_serving_status", {}).get(pipeline_id)
+                    expected_boot_id = observed.message.boot_id if observed is not None else None
+                    try:
+                        binding = self._core.prepare_dispatch_candidate(
+                            session_id=goal.session_id,
+                            session_generation=goal.session_generation,
+                            pipeline_id=pipeline_id,
+                            expected_boot_id=expected_boot_id,
+                        )
+                    except SchedulerError as exc:
+                        return self._dispatch_not_started(goal_handle, goal, pipeline_id, str(exc), "")
+                    if binding.pipeline_id is None:
+                        last_reason = getattr(binding, "reason", "pipeline_unavailable")
+                        last_recoverable = True
+                        continue
+                    if getattr(binding, "reason", "") == "binding_open_in_progress":
+                        last_reason = "binding_open_in_progress"
+                        last_detail = "pipeline binding did not settle"
+                        last_recoverable = True
+                        continue
                 required_work_class = WorkClass.SESSION_CONTROL if binding.needs_open else WorkClass.ACTION_GENERATION
                 if not self._capacity_accepting(pipeline_id, required_work_class):
                     if binding.needs_open:
@@ -964,7 +1139,17 @@ class GlobalInferenceSchedulerNode(Node):
                     last_reason = "pipeline_busy"
                     last_recoverable = True
                     continue
-                if goal.priority == 0:
+                if priority_zero_scheduling:
+                    observed = getattr(self, "_serving_status", {}).get(pipeline_id)
+                    status = observed.message if observed is not None else None
+                    if status is not None and not status.supports_priority_zero_deadline_admission:
+                        if binding.needs_open:
+                            self._core.release_dispatch_candidate(
+                                session_id=goal.session_id, pipeline_id=pipeline_id, not_started=True
+                            )
+                        last_reason = "priority_zero_deadline_admission_not_supported"
+                        last_recoverable = True
+                        continue
                     reservation, detail = self._reserve_priority_zero(
                         pipeline_id=pipeline_id,
                         hardware_resource_id=candidate.hardware_resource_id,
@@ -1051,11 +1236,21 @@ class GlobalInferenceSchedulerNode(Node):
                                 open_call.result.error.code or "binding_open_failed",
                                 open_call.result.error.message,
                             )
+                        opened_generation = int(
+                            getattr(
+                                open_call.result,
+                                "pipeline_generation",
+                                getattr(open_call.result, "session_generation", 0),
+                            )
+                        )
                         close_raced = self._core.record_binding_open_success(
                             session_id=goal.session_id,
                             pipeline_id=pipeline_id,
-                            pipeline_generation=int(open_call.result.session_generation),
+                            pipeline_generation=opened_generation,
                             hardware_resource_id=candidate.hardware_resource_id,
+                            binding_id=getattr(open_call.result, "binding_id", None),
+                            binding_incarnation=getattr(open_call.result, "binding_incarnation", None),
+                            boot_id=getattr(open_call.result, "boot_id", None),
                         )
                         if close_raced:
                             self._release_reservation(reservation)
@@ -1063,7 +1258,7 @@ class GlobalInferenceSchedulerNode(Node):
                             return self._dispatch_not_started(
                                 goal_handle, goal, pipeline_id, "session_closing", "", recoverable=False
                             )
-                        pipeline_generation = int(open_call.result.session_generation)
+                        pipeline_generation = opened_generation
                     call, _downstream_goal = self._dispatch_bound_pipeline(
                         goal_handle,
                         goal,
@@ -1084,7 +1279,28 @@ class GlobalInferenceSchedulerNode(Node):
                         return self._dispatch_unknown(goal_handle, goal, pipeline_id, call.reason)
                     self._release_reservation(reservation)
                     reservation = None
-                    result = call.result
+                    downstream_result = call.result
+                    result = ScheduledDispatchInfer.Result()
+                    # Field-for-field copy from the private DispatchPipelineBinding
+                    # result. Keep this list in sync with the public
+                    # ScheduledDispatchInfer.result field set —
+                    # test_scheduler_node_guards.py::test_public_dispatch_result_fields_cover_private_result
+                    # fails when the two message definitions drift apart.
+                    for field in (
+                        "action_chunk",
+                        "chunk_size",
+                        "success",
+                        "inference_latency_ms",
+                        "backend_latency_ms",
+                        "request_id",
+                        "session_id",
+                        "pipeline_id",
+                        "deployment_fingerprint",
+                        "runtime_policy_fingerprint",
+                        "outcome",
+                        "error",
+                    ):
+                        setattr(result, field, getattr(downstream_result, field))
                     result.session_generation = goal.session_generation
                     return self._finish_upstream(goal_handle, result)
                 except Exception:
@@ -1099,7 +1315,9 @@ class GlobalInferenceSchedulerNode(Node):
                 recoverable=last_recoverable,
             )
         finally:
-            self._core.record_request_terminal(goal.session_id)
+            self._core.record_request_terminal(
+                goal.session_id, request_id=goal.request_id, session_generation=goal.session_generation
+            )
 
     def _priority_zero_estimate_ms(
         self,
@@ -1157,6 +1375,7 @@ class GlobalInferenceSchedulerNode(Node):
             estimate_ms += (
                 profile_p99_ms + acceptance_p999_ms + self._goal_acceptance_safety_margin_ms + phase_margin_ms
             )
+        estimate_ms += getattr(self, "_priority_zero_deadline_admission_safety_margin_ms", 0)
         return estimate_ms, ""
 
     def _reserve_priority_zero(
@@ -1168,6 +1387,16 @@ class GlobalInferenceSchedulerNode(Node):
         requires_open: bool,
         prompt_bytes: int,
     ) -> tuple[DeadlineReservation | None, str]:
+        policy = getattr(self, "_global_policy", "fifo")
+        profile_admission = policy == "fifo" and getattr(self, "_priority_zero_deadline_admission_enabled", False)
+        if not profile_admission:
+            reservation = self._deadline_reservations.try_reserve(
+                pipeline_id=pipeline_id,
+                hardware_resource_id=hardware_resource_id,
+                now_ns=time.monotonic_ns(),
+                deadline_ns=deadline_monotonic_ns,
+            )
+            return reservation, "" if reservation is not None else "resource_queue_unavailable_or_expired"
         estimate_ms, reason = self._priority_zero_estimate_ms(
             pipeline_id=pipeline_id,
             requires_open=requires_open,
@@ -1205,16 +1434,28 @@ class GlobalInferenceSchedulerNode(Node):
         *,
         deadline_monotonic_ns: int,
     ) -> _DownstreamCall:
-        downstream_goal = OpenInferenceSession.Goal()
+        binding = self._core.prepare_dispatch_candidate(
+            session_id=goal.session_id,
+            session_generation=goal.session_generation,
+            pipeline_id=candidate.pipeline_id,
+            expected_boot_id=self._serving_status[candidate.pipeline_id].message.boot_id,
+        )
+        downstream_goal = OpenPipelineBinding.Goal()
         downstream_goal.session_id = goal.session_id
+        downstream_goal.logical_generation = goal.session_generation
+        downstream_goal.binding_id = binding.binding_id
+        downstream_goal.binding_incarnation = binding.binding_incarnation
+        downstream_goal.operation_id = str(uuid.uuid4())
+        downstream_goal.expected_boot_id = binding.expected_boot_id
         self._copy_deadline(goal.deadline, downstream_goal.deadline)
         call = self._call_downstream(
             self._pipeline_clients[candidate.pipeline_id]["open"],
             downstream_goal,
+            operation_kind=OperationKind.OPEN,
             deadline_monotonic_ns=deadline_monotonic_ns,
             upstream_goal_handle=goal_handle,
             late_acceptance_callback=lambda late_goal_handle: self._cleanup_late_open(
-                candidate.pipeline_id, goal.session_id, late_goal_handle
+                candidate.pipeline_id, downstream_goal, late_goal_handle
             ),
         )
         if call.result is not None:
@@ -1223,15 +1464,20 @@ class GlobalInferenceSchedulerNode(Node):
                 return _DownstreamCall("unknown", result=call.result, reason=reason)
         return call
 
-    def _cleanup_late_open(self, pipeline_id: str, session_id: str, late_goal_handle) -> None:
+    def _cleanup_late_open(self, pipeline_id: str, open_goal, late_goal_handle) -> None:
         """Cancel a late-accepted Open and issue generation-0 cleanup."""
         with suppress(Exception):
             late_goal_handle.cancel_goal_async()
 
         def _send_close(_open_result_future) -> None:
-            close_goal = CloseInferenceSession.Goal()
-            close_goal.session_id = session_id
-            close_goal.session_generation = 0
+            close_goal = ClosePipelineBinding.Goal()
+            close_goal.session_id = open_goal.session_id
+            close_goal.logical_generation = 0
+            close_goal.binding_id = open_goal.binding_id
+            close_goal.binding_incarnation = open_goal.binding_incarnation
+            close_goal.operation_id = str(uuid.uuid4())
+            close_goal.expected_boot_id = open_goal.expected_boot_id
+            close_goal.expected_pipeline_generation = 0
             self._set_absolute_deadline(close_goal, time.time_ns() + self._default_request_timeout_ns)
 
             def _close_goal_sent(future) -> None:
@@ -1246,8 +1492,16 @@ class GlobalInferenceSchedulerNode(Node):
                         except Exception:  # noqa: BLE001
                             return
                         if result is not None and result.success:
-                            self._core.record_binding_close_success(session_id, pipeline_id)
-                            self._core.record_close_complete(session_id, success=True)
+                            candidate = self._candidate_by_id.get(pipeline_id)
+                            identity_reason = (
+                                self._validate_downstream_result("close", close_goal, result, candidate)
+                                if candidate is not None
+                                else "late_close_pipeline_missing"
+                            )
+                            if identity_reason:
+                                return
+                            self._core.record_binding_close_success(open_goal.session_id, pipeline_id)
+                            self._core.record_close_complete(open_goal.session_id, success=True)
 
                     close_goal_handle.get_result_async().add_done_callback(_close_result_done)
                 except Exception:  # noqa: BLE001
@@ -1269,21 +1523,26 @@ class GlobalInferenceSchedulerNode(Node):
         *,
         pipeline_generation: int,
         deadline_monotonic_ns: int,
-    ) -> tuple[_DownstreamCall, ScheduledDispatchInfer.Goal]:
-        downstream_goal = ScheduledDispatchInfer.Goal()
+    ) -> tuple[_DownstreamCall, DispatchPipelineBinding.Goal]:
+        binding = self._core.session_record(goal.session_id).bindings[candidate.pipeline_id]
+        downstream_goal = DispatchPipelineBinding.Goal()
         downstream_goal.obs_timestamp.sec = goal.obs_timestamp.sec
         downstream_goal.obs_timestamp.nanosec = goal.obs_timestamp.nanosec
         downstream_goal.prompt = goal.prompt
         downstream_goal.request_id = goal.request_id
         downstream_goal.session_id = goal.session_id
-        downstream_goal.session_generation = pipeline_generation
-        downstream_goal.target_pipeline_id = candidate.pipeline_id
-        downstream_goal.fallback_chain = []
+        downstream_goal.logical_generation = goal.session_generation
+        downstream_goal.binding_id = binding.binding_id
+        downstream_goal.binding_incarnation = binding.binding_incarnation
+        downstream_goal.operation_id = str(uuid.uuid4())
+        downstream_goal.expected_boot_id = binding.expected_boot_id or ""
+        downstream_goal.expected_pipeline_generation = pipeline_generation
         self._copy_deadline(goal.deadline, downstream_goal.deadline)
         downstream_goal.priority = goal.priority
         call = self._call_downstream(
             self._pipeline_clients[candidate.pipeline_id]["dispatch"],
             downstream_goal,
+            operation_kind=OperationKind.DISPATCH,
             deadline_monotonic_ns=deadline_monotonic_ns,
             upstream_goal_handle=goal_handle,
         )
@@ -1361,14 +1620,25 @@ class GlobalInferenceSchedulerNode(Node):
             goal_handle.abort()
             return result
 
-        for completed_closes, binding in enumerate(self._core.close_bindings(goal.session_id)):
-            downstream_goal = CloseInferenceSession.Goal()
+        close_unknown = False
+        close_unknown_code = ""
+        close_unknown_pipeline = ""
+        close_failure = ""
+        close_failure_pipeline = ""
+        for binding in self._core.close_bindings(goal.session_id):
+            downstream_goal = ClosePipelineBinding.Goal()
             downstream_goal.session_id = goal.session_id
-            downstream_goal.session_generation = binding.pipeline_generation
+            downstream_goal.logical_generation = logical_generation
+            downstream_goal.binding_id = getattr(binding, "binding_id", "")
+            downstream_goal.binding_incarnation = getattr(binding, "binding_incarnation", 1)
+            downstream_goal.operation_id = getattr(binding, "close_operation_id", None) or str(uuid.uuid4())
+            downstream_goal.expected_boot_id = getattr(binding, "expected_boot_id", None) or ""
+            downstream_goal.expected_pipeline_generation = binding.pipeline_generation
             self._copy_deadline(goal.deadline, downstream_goal.deadline)
             call = self._call_downstream(
                 self._pipeline_clients[binding.pipeline_id]["close"],
                 downstream_goal,
+                operation_kind=OperationKind.CLOSE,
                 deadline_monotonic_ns=deadline_monotonic_ns,
             )
             candidate = self._candidate_by_id[binding.pipeline_id]
@@ -1378,48 +1648,41 @@ class GlobalInferenceSchedulerNode(Node):
                     call = _DownstreamCall("unknown", result=call.result, reason=identity_reason)
             if call.certainty == "unknown":
                 self._core.mark_session_failed(goal.session_id, pipeline_id=binding.pipeline_id)
-                result = CloseInferenceSession.Result()
-                result.session_id = goal.session_id
-                result.pipeline_id = binding.pipeline_id
-                result.closed_session_generation = logical_generation
-                result.outcome.value = InferenceOutcome.UNKNOWN
-                self._set_error(result.error, code=call.reason or "close_outcome_unknown", stage="close")
-                goal_handle.abort()
-                return result
+                close_unknown = True
+                close_unknown_code = call.reason or "close_outcome_unknown"
+                close_unknown_pipeline = binding.pipeline_id
+                continue
             if call.certainty == "not_started":
-                if completed_closes == 0:
-                    self._core.record_close_not_started(goal.session_id)
-                    result = CloseInferenceSession.Result()
-                    result.session_id = goal.session_id
-                    result.pipeline_id = binding.pipeline_id
-                    result.outcome.value = InferenceOutcome.NOT_STARTED
-                    self._set_error(
-                        result.error,
-                        code=call.reason or "downstream_not_started",
-                        recoverable=self._call_recoverable(call),
-                        stage="close",
-                    )
-                    goal_handle.abort()
-                    return result
                 self._core.mark_session_failed(goal.session_id, pipeline_id=binding.pipeline_id)
-                return self._close_completed_failure(
-                    goal_handle,
-                    goal.session_id,
-                    binding.pipeline_id,
-                    logical_generation,
-                    "partial_close_not_started",
-                )
+                close_failure = call.reason or "downstream_not_started"
+                close_failure_pipeline = binding.pipeline_id
+                continue
             if not call.result.success:
                 self._core.mark_session_failed(goal.session_id, pipeline_id=binding.pipeline_id)
-                return self._close_completed_failure(
-                    goal_handle,
-                    goal.session_id,
-                    binding.pipeline_id,
-                    logical_generation,
-                    call.result.error.code or "close_failed",
-                )
+                close_failure = call.result.error.code or "close_failed"
+                close_failure_pipeline = binding.pipeline_id
+                continue
             self._core.record_binding_close_success(goal.session_id, binding.pipeline_id)
 
+        if close_unknown:
+            self._core.record_close_complete(goal.session_id, success=False, unresolved=True)
+            result = CloseInferenceSession.Result()
+            result.session_id = goal.session_id
+            result.pipeline_id = close_unknown_pipeline
+            result.closed_session_generation = logical_generation
+            result.outcome.value = InferenceOutcome.UNKNOWN
+            self._set_error(result.error, code=close_unknown_code, stage="close")
+            goal_handle.abort()
+            return result
+        if close_failure:
+            self._core.record_close_complete(goal.session_id, success=False, unresolved=True)
+            return self._close_completed_failure(
+                goal_handle,
+                goal.session_id,
+                close_failure_pipeline,
+                logical_generation,
+                close_failure,
+            )
         drained_generation = self._core.record_close_complete(goal.session_id, success=True)
         result = CloseInferenceSession.Result()
         result.success = True

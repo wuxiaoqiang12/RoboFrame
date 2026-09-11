@@ -9,6 +9,9 @@ pipeline ID，并支持单体和边云分布式执行。
 
 非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。公共本地执行通过
 `ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)` 进入，成功结果统一为 `ModelResult`；
+独立 producer 帧通过 `ModelRuntimeHandle.submit_frame(ModelRequest, ExecutionContext)` 返回 future，
+与 Dispatch 共用请求登记、取消、失败处理和生命周期排空。帧有独立的有界准入额度，允许 producer 与
+Dispatch 重叠执行，统一 diagnostics 的活动计数包含两者。
 `ModelRuntimeFactory` 是注册式构造入口，不是请求边界。`ModelRuntimeHandle` 接受 `RuntimeAssembly` 的
 所有权转移，负责公开生命周期、准入、deadline、取消、健康状态和关闭等待。`ModelSession` 是 assembly
 中的资源，只负责加载、执行和释放 vendor 模型对象、设备 lease、buffer 或 worker。
@@ -151,9 +154,16 @@ Pipeline ID 是模型实例和 ROS 路由的稳定标识，必须匹配
 `InferencePipeline` 是策略模型 facade，把既有 policy 请求/结果契约适配到
 `ModelRuntimeHandle`。Handle 统一生命周期、准入、deadline、cancellation、health 和 diagnostics，并按
 `RuntimeAssembly` 的 owned component 顺序加载、反向释放资源。编译模型由
-`SequentialModelExecutor` 按 `InferenceStage` 序列执行；循环 family 通过 `IterativeStage` 驱动多个 role。
+顺序或 staged executor 按 `InferenceStage` 编排，共用 `ComponentModelExecutor` 的组件辅助逻辑；
+循环 family 通过 `IterativeStage` 驱动多个 role。
 同一个 `ExecutionContext` 把 request ID、deadline 和 cancellation token 传到各 stage 与
 `ModelSession` resource；session 持有跨 role 复用的 vendor 设备资源。
+两种策略都通过 `ModelSession.execute_role()` 校验角色张量，Ascend 在内部选择隔离 dataset，
+继续复用语义绑定和诊断采集。producer/terminal 从 `deployment.execution` 的两个角色推导，
+`functional_execution` 仅声明能力，不再重复提供 `stages` 拓扑。
+PI0.5 OM 转换器发布标准 `vlm` / `action_expert` 双段 deployment 时会写入该能力声明；
+旧 bundle 需要通过转换器重新发布 manifest 和 artifacts，不能仅凭模型类型手工启用。
+independent 模式要求 Ascend、单实例及受支持的双段拓扑，加载时仍检查设备的 priority stream 能力。
 
 默认 endpoint：
 
@@ -195,16 +205,24 @@ pipeline、fallback chain、priority 和 deadline；候选首次被该 session �
 下发私有 Open/reset 并记录其 pipeline generation。同一个逻辑 session 可按需建立多个 pipeline binding。
 Close 停止新 admission，并逐一 drain/reset 实际使用过的全部 binding；从未 Dispatch 的 session 可直接关闭。
 
-priority-0 请求按 `[target, *fallback_chain]` 顺序逐个检查。`profile_path` 可选，但实际参与本次准入的候选
-必须有匹配身份、覆盖当前输入契约和 prompt 大小、未过期的离线测量：
-已绑定候选使用 `full_infer` closure；尚未绑定的候选还必须包含 `session_open` closure，确保 Open/reset 与推理
-其 p99 admission SLA 估计加 safety margin 不超过该请求的绝对 deadline。同一个 `hardware_resource_id` 上已准入的 priority-0 工作按同优先级
-FIFO 串行下发：reservation 未成为资源队首前不会 Open/Dispatch；真正取得下发权时会按当前剩余时间再次检查
-deadline。已知未开始或已知完成时释放，执行结果不确定时保持隔离直到对应 pipeline 重启。
-这不是 pipeline 数量上限，也不限制 priority 大于 0 的请求。缺失或无效 profile 的候选按不可准入处理并继续
-fallback；没有候选可完成时返回
-`no_feasible_deadline/NOT_STARTED`，不会下发；
-`NOT_STARTED` 才继续下一个 fallback，`UNKNOWN` 立即 quarantine，绝不 fallback。Global ingress 仍保持有界：
+priority-0 的资源排序和 fallback 取决于配置，默认不启用 profile 准入：
+
+| `global_policy` | `priority_zero_deadline_admission.enable` | 行为 |
+| --- | --- | --- |
+| `fifo`（默认） | `false`（默认） | 直接下发 target，不建立资源等待队列；不接受非空 fallback chain |
+| `fifo` | `true` | 用离线 profile 做完成时间准入，同资源按 FIFO 串行下发；支持 fallback，仅接受 sequential pipeline |
+| `edf` | `false` | 同资源等待中的请求按绝对 deadline 排序，同 deadline 按 FIFO；支持 fallback，仅接受 sequential pipeline，不使用 profile 预测完成时间 |
+
+EDF 不抢占已开始的请求，也不保证 deadline 前完成。deadline 驱动（EDF 或 FIFO profile 准入）的
+priority-0 是 sequential-only 契约：independent pipeline 把一个请求拆到两个 worker 上重叠执行，
+per-request deadline 排序无法评估也无法兑现；robot_config 会在配置加载期拒绝该组合的 target 和
+fallback 链，Global 也会按 serving status 能力跳过 independent 候选。FIFO profile 准入按 `[target, *fallback_chain]`
+检查匹配身份、输入契约、prompt 大小和有效期的离线测量：已绑定候选使用 `full_infer`，未绑定候选
+还需要 `session_open`。p99 估计加 safety margin 必须落在 deadline 内，获得资源下发权时再次检查。
+缺失或无效 profile 的候选会被跳过；无可行候选时返回 `no_feasible_deadline/NOT_STARTED`。
+启用 scheduler 时，不支持的默认 FIFO/fallback 组合和 deadline 驱动 priority-0 选择 independent pipeline
+都会在配置加载时报错。priority 大于 0 只使用 target，不受该 sequential-only 约束。
+仅 `NOT_STARTED` 允许继续 fallback；`UNKNOWN` 保持隔离，绝不重试或 fallback。Global ingress 仍保持有界：
 Open/Close 各两个执行 context；Dispatch 共四个 context，其中 lower-priority 最多占两个，不能耗尽为 priority-0
 保留的进入能力。priority-0 可使用任意空闲 Dispatch context。
 

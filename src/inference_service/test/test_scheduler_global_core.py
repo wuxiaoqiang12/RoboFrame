@@ -293,22 +293,20 @@ def test_close_drains_every_used_binding_and_advances_only_logical_generation():
     assert scheduler.session_state(SESSION_ID) == GlobalSessionState.CLOSED
 
 
-def test_not_started_close_restores_active_binding_for_retry():
+def test_close_does_not_reopen_session():
     scheduler, _ = _make()
     _open_active(scheduler)
     _bind(scheduler, "pi05", pipeline_generation=6)
     scheduler.begin_close(session_id=SESSION_ID, session_generation=1)
     assert [binding.pipeline_id for binding in scheduler.close_bindings(SESSION_ID)] == ["pi05"]
 
-    scheduler.record_close_not_started(SESSION_ID)
-
-    assert scheduler.session_state(SESSION_ID) == GlobalSessionState.ACTIVE
-    decision = scheduler.prepare_dispatch_candidate(
-        session_id=SESSION_ID,
-        session_generation=1,
-        pipeline_id="pi05",
-    )
-    assert decision.pipeline_generation == 6
+    assert scheduler.session_state(SESSION_ID) == GlobalSessionState.CLOSING
+    with pytest.raises(SchedulerError, match="session_not_active"):
+        scheduler.prepare_dispatch_candidate(
+            session_id=SESSION_ID,
+            session_generation=1,
+            pipeline_id="pi05",
+        )
 
 
 def test_unknown_cleanup_is_not_retention_purged():
@@ -338,3 +336,157 @@ def test_lease_renews_per_request_and_waits_for_in_flight_terminal():
     assert scheduler.expired_sessions() == []
     scheduler.record_request_terminal(SESSION_ID)
     assert scheduler.expired_sessions() == [SESSION_ID]
+
+
+def test_close_waits_for_in_flight_dispatch_before_settling():
+    scheduler, clock = _make()
+    _open_active(scheduler)
+    scheduler.resolve_dispatch_plan(
+        session_id=SESSION_ID,
+        session_generation=1,
+        target_pipeline_id="pi05",
+        fallback_chain=[],
+        priority=0,
+    )
+    scheduler.begin_close(session_id=SESSION_ID, session_generation=1)
+
+    settled: list[bool] = []
+    waiter = threading.Thread(
+        target=lambda: settled.append(scheduler.wait_for_bindings_to_settle(SESSION_ID, clock.now_ns() + 1_000_000_000))
+    )
+    waiter.start()
+    waiter.join(timeout=0.1)
+    assert waiter.is_alive()
+
+    scheduler.record_request_terminal(SESSION_ID)
+    waiter.join(timeout=1.0)
+    assert not waiter.is_alive()
+    assert settled == [True]
+    assert scheduler.record_close_complete(SESSION_ID, success=True) == 2
+    assert scheduler.session_state(SESSION_ID) == GlobalSessionState.CLOSED
+
+
+def test_wait_for_binding_open_blocks_dispatch_until_lazy_open_settles():
+    scheduler, clock = _make()
+    _open_active(scheduler)
+    scheduler.resolve_dispatch_plan(
+        session_id=SESSION_ID,
+        session_generation=1,
+        target_pipeline_id="pi05",
+        fallback_chain=[],
+        priority=1,
+    )
+    first = scheduler.prepare_dispatch_candidate(
+        session_id=SESSION_ID,
+        session_generation=1,
+        pipeline_id="pi05",
+    )
+    second = scheduler.prepare_dispatch_candidate(
+        session_id=SESSION_ID,
+        session_generation=1,
+        pipeline_id="pi05",
+    )
+    assert first.needs_open
+    assert second.reason == "binding_open_in_progress"
+
+    started = threading.Event()
+    settled: list[bool] = []
+
+    def wait_for_open() -> None:
+        started.set()
+        settled.append(
+            scheduler.wait_for_binding_open(
+                session_id=SESSION_ID,
+                pipeline_id="pi05",
+                deadline_monotonic_ns=clock.now_ns() + 1_000_000_000,
+            )
+        )
+
+    waiter = threading.Thread(target=wait_for_open)
+    waiter.start()
+    assert started.wait(timeout=1.0)
+    scheduler.record_binding_open_success(
+        session_id=SESSION_ID,
+        pipeline_id="pi05",
+        pipeline_generation=7,
+        hardware_resource_id="ascend:0",
+    )
+    waiter.join(timeout=1.0)
+
+    assert not waiter.is_alive()
+    assert settled == [True]
+    active = scheduler.prepare_dispatch_candidate(
+        session_id=SESSION_ID,
+        session_generation=1,
+        pipeline_id="pi05",
+    )
+    assert active.pipeline_generation == 7
+    assert active.reason == ""
+
+
+def test_pipeline_boot_change_drops_active_old_binding_for_safe_rebind():
+    scheduler, _clock = _make()
+    _open_active(scheduler)
+    binding = scheduler.prepare_dispatch_candidate(
+        session_id=SESSION_ID,
+        session_generation=1,
+        pipeline_id="pi05",
+        expected_boot_id="123e4567-e89b-42d3-a456-426614174010",
+    )
+    scheduler.record_binding_open_success(
+        session_id=SESSION_ID,
+        pipeline_id="pi05",
+        pipeline_generation=4,
+        hardware_resource_id="ascend:0",
+        binding_id=binding.binding_id,
+        binding_incarnation=binding.binding_incarnation,
+        boot_id="123e4567-e89b-42d3-a456-426614174010",
+    )
+
+    scheduler.reconcile_pipeline_boot(
+        "pi05",
+        boot_id="123e4567-e89b-42d3-a456-426614174011",
+    )
+
+    record = scheduler.session_record(SESSION_ID)
+    assert record is not None
+    assert record.state == GlobalSessionState.ACTIVE
+    assert record.bindings == {}
+    rebound = scheduler.prepare_dispatch_candidate(
+        session_id=SESSION_ID,
+        session_generation=1,
+        pipeline_id="pi05",
+        expected_boot_id="123e4567-e89b-42d3-a456-426614174011",
+    )
+    assert rebound.needs_open
+
+
+@pytest.mark.parametrize("remaining_owner", ["none", "request", "binding"])
+def test_fenced_failed_session_is_retained_only_until_all_owners_drain(remaining_owner):
+    scheduler, clock = _make(candidates=[_candidate("pi05"), _candidate("backup")], max_session_records=1)
+    _open_active(scheduler)
+    scheduler.prepare_dispatch_candidate(
+        session_id=SESSION_ID, session_generation=1, pipeline_id="pi05", expected_boot_id="old-boot"
+    )
+    if remaining_owner == "binding":
+        _bind(scheduler, "backup", pipeline_generation=2)
+    if remaining_owner == "request":
+        scheduler.resolve_dispatch_plan(
+            session_id=SESSION_ID, session_generation=1, target_pipeline_id="pi05", fallback_chain=[], priority=0
+        )
+    scheduler.mark_session_failed(SESSION_ID, pipeline_id="pi05")
+    scheduler.reconcile_pipeline_boot("pi05", boot_id="new-boot")
+    assert scheduler.session_state(SESSION_ID) == GlobalSessionState.QUARANTINED
+    clock.advance(2_000_000_000)
+    if remaining_owner != "none":
+        with pytest.raises(SchedulerError, match="max_session_records"):
+            scheduler.open_session(session_id=OTHER_SESSION_ID)
+        if remaining_owner == "binding":
+            scheduler.record_binding_close_success(SESSION_ID, "backup")
+        else:
+            scheduler.record_request_terminal(SESSION_ID)
+        with pytest.raises(SchedulerError, match="max_session_records"):
+            scheduler.open_session(session_id=OTHER_SESSION_ID)
+        clock.advance(2_000_000_000)
+    scheduler.open_session(session_id=OTHER_SESSION_ID)
+    assert scheduler.session_record(SESSION_ID) is None

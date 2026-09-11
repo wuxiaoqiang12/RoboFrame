@@ -10,6 +10,7 @@ mujoco_ros2_control simulation by tracking arm /joint_states and stepping a
 local mujoco Python instance in a background thread.
 """
 
+import argparse
 import json
 import threading
 import time
@@ -109,7 +110,7 @@ class ShadowSim:
 class PickBananaTask(SceneTask):
     scene_name = "pick_banana"
 
-    def __init__(self, node: Node) -> None:
+    def __init__(self, node: Node, *, scheduled_dispatch: bool = False) -> None:
         self._node = node
         self._cbg = ReentrantCallbackGroup()
 
@@ -164,8 +165,8 @@ class PickBananaTask(SceneTask):
         self._disp_start = node.create_client(Trigger, "/action_dispatcher/start_evaluate", callback_group=self._cbg)
         self._disp_stop = node.create_client(Trigger, "/action_dispatcher/stop_evaluate", callback_group=self._cbg)
         self._disp_reset = node.create_client(Empty, "/action_dispatcher/reset", callback_group=self._cbg)
-        restart_service = str(node.declare_parameter("restart_session_service", "").value)
-        self._scheduled_dispatch = bool(restart_service)
+        legacy_restart_service = str(node.declare_parameter("restart_session_service", "").value).strip()
+        self._scheduled_dispatch = scheduled_dispatch or bool(legacy_restart_service)
 
         # Arm command publishers + rest pose. Re-commanding the rest pose right
         # before a world reset aligns the controller setpoint with the keyframe,
@@ -516,10 +517,19 @@ class PickBananaTask(SceneTask):
 # ─── Node entrypoint ──────────────────────────────────────────────────────────
 
 
-def main() -> None:
-    rclpy.init()
+def _parse_app_args(args=None) -> tuple[bool, list[str]]:
+    """Remove scheduler-only application flags before ROS argument parsing."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--scheduled-dispatch", action="store_true")
+    parsed, ros_args = parser.parse_known_args(args)
+    return bool(parsed.scheduled_dispatch), ros_args
+
+
+def main(args=None) -> None:
+    scheduled_dispatch, ros_args = _parse_app_args(args)
+    rclpy.init(args=ros_args)
     node = Node("pick_banana_task_node")
-    task = PickBananaTask(node)  # noqa: F841 — registers services on node
+    task = PickBananaTask(node, scheduled_dispatch=scheduled_dispatch)  # noqa: F841 — registers services on node
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:

@@ -1,0 +1,25 @@
+# Scheduled-only private Global -> Pipeline binding protocol.
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 expected_boot_id
+builtin_interfaces/Time deadline
+---
+bool success
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 boot_id
+string<=63 pipeline_id
+uint64 pipeline_generation
+string<=64 deployment_fingerprint
+string<=64 runtime_policy_fingerprint
+builtin_interfaces/Time lease_expires_at
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+string<=128 status

@@ -431,6 +431,29 @@ def generate_inference_node(
             parameters["terminal_result_cache_entries"] = scheduler.terminal_result_cache_entries
             parameters["max_duplicate_waiters_per_request"] = scheduler.max_duplicate_waiters_per_request
             parameters["terminal_session_retention_ns"] = scheduler.terminal_session_retention_ns
+            scheduling = pipeline.scheduling
+            parameters["pipeline_stage_policy"] = scheduling.stage_policy if scheduling else "sequential"
+            parameters["pipeline_scheduling_json"] = (
+                json.dumps(
+                    {
+                        "stage_policy": scheduling.stage_policy,
+                        "frame_base_priority": scheduling.frame_base_priority,
+                        "max_supported_public_priority": scheduling.max_supported_public_priority,
+                        "stages": {
+                            stage_id: {
+                                "priority_offset": stage.priority_offset,
+                                "instance_count": stage.instance_count,
+                            }
+                            for stage_id, stage in scheduling.stages.items()
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if scheduling
+                else ""
+            )
+            parameters["max_supported_public_priority"] = scheduling.max_supported_public_priority if scheduling else 7
             parameters["public_capacity_json"] = json.dumps(
                 {wc.work_class: {"max_in_flight": wc.max_in_flight} for wc in pipeline.public_capacity.values()},
                 sort_keys=True,
@@ -766,6 +789,10 @@ def generate_global_inference_scheduler_node(
                 "runtime_policy_fingerprint": pipeline.runtime_policy_fingerprint or "",
                 "profile_compatibility_fingerprint": pipeline.profile_compatibility_fingerprint or "",
                 "profile_path": str(pipeline.profile_path) if pipeline.profile_path else "",
+                "max_supported_public_priority": (
+                    pipeline.scheduling.max_supported_public_priority if pipeline.scheduling else 7
+                ),
+                "stage_policy": pipeline.scheduling.stage_policy.upper() if pipeline.scheduling else "SEQUENTIAL",
                 "public_capacity": {
                     capacity.work_class: {
                         "max_in_flight": capacity.max_in_flight,
@@ -808,6 +835,11 @@ def generate_global_inference_scheduler_node(
                 "terminal_session_retention_ns": scheduler.terminal_session_retention_ns,
                 "max_session_records": scheduler.max_session_records,
                 "default_priority": inference.inference_priority,
+                "global_policy": scheduler.global_policy,
+                "priority_zero_deadline_admission_enabled": scheduler.priority_zero_deadline_admission.enable,
+                "priority_zero_deadline_admission_safety_margin_ms": (
+                    scheduler.priority_zero_deadline_admission.safety_margin_ms
+                ),
                 "use_sim_time": use_sim_time,
             }
         ],

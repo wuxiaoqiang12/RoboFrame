@@ -58,6 +58,7 @@ from inference_manifest.models import (
     ExecutionContract,
     ExecutionPolicy,
     ExecutionRole,
+    FunctionalExecutionCapability,
     HisiliconRuntimeProfile,
     HMMRuntimeProfile,
     InferenceManifest,
@@ -83,6 +84,7 @@ from inference_manifest.models import (
     TorchRuntimeProfile,
     ValidatedDeployment,
     canonical_model_identity,
+    is_image_semantic,
     parse_backend_runtime_profile,
     profile_field_classification,
 )
@@ -96,6 +98,7 @@ from inference_manifest.schema import manifest_schema, validate_manifest_schema
 from inference_manifest.writer import canonical_manifest_bytes, write_inference_manifest
 
 __all__ = [
+    "is_image_semantic",
     "ArtifactBindings",
     "ArtifactDigestMismatch",
     "ARTIFACT_DIGEST_MISMATCH",
@@ -123,6 +126,7 @@ __all__ = [
     "ExecutionContract",
     "ExecutionPolicy",
     "ExecutionRole",
+    "FunctionalExecutionCapability",
     "ExternalDependency",
     "InferenceManifest",
     "IntegrityReport",

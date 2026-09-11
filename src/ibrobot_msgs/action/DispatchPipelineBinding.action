@@ -1,0 +1,34 @@
+# Scheduled-only private Global -> Pipeline dispatch protocol.
+builtin_interfaces/Time obs_timestamp
+string<=4096 prompt
+string<=36 request_id
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 expected_boot_id
+uint64 expected_pipeline_generation
+builtin_interfaces/Time deadline
+int32 priority
+---
+ibrobot_msgs/VariantsList action_chunk
+int32 chunk_size
+bool success
+float64 inference_latency_ms
+float64 backend_latency_ms
+string<=36 request_id
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 boot_id
+string<=63 pipeline_id
+uint64 pipeline_generation
+string<=64 deployment_fingerprint
+string<=64 runtime_policy_fingerprint
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+string<=128 status

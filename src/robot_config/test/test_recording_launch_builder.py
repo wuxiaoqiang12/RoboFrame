@@ -24,8 +24,10 @@ def test_record_cli_command_is_legacy_when_scheduler_is_disabled():
 
 
 def test_record_cli_command_uses_session_restart_when_scheduler_enabled():
-    assert _record_cli_command("model_inference", scheduler_enabled=True).endswith(
-        " -p restart_session_service:=/action_dispatcher/restart_session"
+    assert _record_cli_command("model_inference", scheduler_enabled=True) == (
+        "ros2 run dataset_tools record_cli "
+        "--restart-session-service /action_dispatcher/restart_session "
+        "--ros-args -p control_mode:=model_inference"
     )
 
 

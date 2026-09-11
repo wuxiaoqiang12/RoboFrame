@@ -5,6 +5,7 @@ Command Line Interface for triggering episodic recordings.
 Sends Action goals to the EpisodeRecorderServer.
 """
 
+import argparse
 import json
 import sys
 import threading
@@ -21,7 +22,7 @@ from ibrobot_msgs.action import RecordEpisode
 
 
 class RecordCLI(Node):
-    def __init__(self):
+    def __init__(self, *, restart_session_service: str = ""):
         super().__init__("record_cli")
 
         self.declare_parameter("dispatcher_reset_service", "/action_dispatcher/reset")
@@ -50,8 +51,12 @@ class RecordCLI(Node):
             Trigger,
             self.get_parameter("policy_reset_service").value,
         )
-        restart_service = str(self.get_parameter("restart_session_service").value)
-        self._restart_session_client = self.create_client(Trigger, restart_service) if restart_service else None
+        configured_restart_service = (
+            restart_session_service or str(self.get_parameter("restart_session_service").value).strip()
+        )
+        self._restart_session_client = (
+            self.create_client(Trigger, configured_restart_service) if configured_restart_service else None
+        )
         # Service client to get dataset info
         self._info_client = self.create_client(Trigger, "record_episode/get_info")
         self._last_episode_client = self.create_client(Trigger, "record_episode/get_last_episode")
@@ -554,9 +559,18 @@ def cli_loop(node):
             traceback.print_exc()
 
 
+def _parse_app_args(args=None) -> tuple[str, list[str]]:
+    """Remove scheduler-only application flags before ROS argument parsing."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--restart-session-service", default="")
+    parsed, ros_args = parser.parse_known_args(args)
+    return str(parsed.restart_session_service), ros_args
+
+
 def main(args=None):
-    rclpy.init(args=args)
-    node = RecordCLI()
+    restart_session_service, ros_args = _parse_app_args(args)
+    rclpy.init(args=ros_args)
+    node = RecordCLI(restart_session_service=restart_session_service)
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
 

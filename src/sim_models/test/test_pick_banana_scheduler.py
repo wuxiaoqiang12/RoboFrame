@@ -2,9 +2,53 @@
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
-from sim_models.tasks.pick_banana import PickBananaTask
+from sim_models.tasks.pick_banana import PickBananaTask, _parse_app_args
+
+_PRE_SCHEDULER_PARAMETERS = {
+    "arm_command_topic",
+    "eval_output_dir",
+    "gripper_command_topic",
+    "reset_world_service",
+    "restart_session_service",
+}
+
+
+def _declared_parameter_names(source: Path) -> set[str]:
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    return {
+        call.args[0].value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "declare_parameter"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+        and isinstance(call.args[0].value, str)
+    }
+
+
+def test_pick_banana_ros_parameter_surface_matches_pre_scheduler_baseline():
+    source = Path(__file__).resolve().parents[1] / "sim_models" / "tasks" / "pick_banana.py"
+
+    assert _declared_parameter_names(source) == _PRE_SCHEDULER_PARAMETERS
+
+
+def test_legacy_app_args_do_not_add_a_scheduler_parameter():
+    scheduled, ros_args = _parse_app_args(["--ros-args", "-p", "use_sim_time:=true"])
+
+    assert not scheduled
+    assert ros_args == ["--ros-args", "-p", "use_sim_time:=true"]
+
+
+def test_scheduled_app_arg_is_removed_before_ros_parsing():
+    scheduled, ros_args = _parse_app_args(["--scheduled-dispatch", "--ros-args", "-p", "use_sim_time:=true"])
+
+    assert scheduled
+    assert ros_args == ["--ros-args", "-p", "use_sim_time:=true"]
 
 
 def _task() -> PickBananaTask:

@@ -284,12 +284,12 @@ class DeploymentArtifact(StrictFrozenModel):
 _IMAGE_SEMANTIC_PREFIXES = ("observation.image.", "observation.images.")
 
 
-def _is_image_semantic(semantic: str) -> bool:
+def is_image_semantic(semantic: str) -> bool:
     return semantic == "observation.image" or semantic.startswith(_IMAGE_SEMANTIC_PREFIXES)
 
 
 def _validate_layout(shape: tuple[int, ...], layout: str | None, semantic: str) -> None:
-    needs_layout = len(shape) == 4 and _is_image_semantic(semantic)
+    needs_layout = len(shape) == 4 and is_image_semantic(semantic)
     if needs_layout and layout is None:
         raise ValueError(f"rank-4 image tensor {semantic!r} requires NCHW or NHWC layout")
     if len(shape) != 4 and layout is not None:
@@ -866,6 +866,21 @@ class DeviceLink(StrictFrozenModel):
         return self
 
 
+class FunctionalExecutionCapability(StrictFrozenModel):
+    """Evidence required by the independently triggered staged executor."""
+
+    schema_version: Literal[1]
+    supports_async_stage_submission: Literal[True]
+    per_model_dataset_isolation: Literal[True]
+    per_model_output_isolation: Literal[True]
+    atomic_latest_result_publish: Literal[True]
+    immutable_result_publish: Literal[True]
+    result_version_fence: Literal[True]
+    intermediate_buffer_isolation: Literal[True]
+    supports_priority_streams: Literal[True]
+    max_concurrent_executions_per_model_instance: Literal[1] = 1
+
+
 class Deployment(StrictFrozenModel):
     """One v3 named deployment, independent of backend construction code."""
 
@@ -882,6 +897,7 @@ class Deployment(StrictFrozenModel):
     execution: tuple[ExecutionRole, ...] = ()
     bindings: dict[ExecutionRole, ArtifactBindings] = Field(default_factory=dict)
     device_links: tuple[DeviceLink, ...] = ()
+    functional_execution: FunctionalExecutionCapability | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @property
@@ -941,6 +957,9 @@ class Deployment(StrictFrozenModel):
             raise ValueError(
                 f"artifact roles must contain every execution role (missing={sorted(execution_roles - artifact_roles)})"
             )
+
+        if self.functional_execution is not None and len(self.execution) != 2:
+            raise ValueError("functional_execution requires exactly the two declared execution roles")
 
         if self.role_identities is None:
             if self.role_runtime_profiles is not None:

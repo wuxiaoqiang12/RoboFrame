@@ -223,3 +223,74 @@ def test_tracked_equivalent_cpu_bundle_runs_unified_registry_pipeline_end_to_end
     manager.close()
     manager.close()
     dependencies.providers.close()
+
+
+@pytest.mark.parametrize("scheduler", [None, {"enable": False}], ids=["absent", "disabled"])
+@pytest.mark.parametrize("reset_fails", [False, True])
+def test_legacy_policy_late_result_recovers_only_after_successful_reset(monkeypatch, tmp_path, scheduler, reset_fails):
+    from inference_service.pipeline.errors import PipelineTimeoutError
+
+    torch = pytest.importorskip("torch")
+    bundle = _create_tracked_equivalent_bundle(tmp_path / MODEL_NAME)
+    calls = {}
+    _install_fake_lerobot(monkeypatch, torch, calls)
+    inference_config = {
+        "enabled": True,
+        "pipelines": {
+            "policy": {
+                "model_path": str(bundle),
+                "deployment": "cpu",
+                "execution_mode": "monolithic",
+            }
+        },
+    }
+    if scheduler is not None:
+        inference_config["scheduler"] = scheduler
+    config = parse_inference_config(
+        {"control_modes": {"model_inference": {"inference": inference_config}}}, "model_inference"
+    )
+    dependencies = build_policy_runtime_dependencies()
+    manager = create_pipeline_manager(
+        "policy",
+        config.pipelines["policy"].validated_manifest,
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
+    pipeline = manager.pipelines["policy"]
+    request = InferenceRequest(
+        "late",
+        inputs={
+            "observation.state": np.zeros(6, dtype=np.float32),
+            "observation.images.top": np.zeros((480, 640, 3), dtype=np.uint8),
+        },
+    )
+    postprocess = pipeline._postprocessor
+
+    def late_result(_action):
+        raise pipeline._timeout_error("postprocess", backend_completed=True)
+
+    try:
+        assert pipeline.capabilities.stateful and pipeline.capabilities.resettable
+        monkeypatch.setattr(pipeline, "_postprocessor", late_result)
+        with pytest.raises(PipelineTimeoutError):
+            manager.infer("policy", request)
+        failure = pipeline._policy_failure
+        assert failure is not None
+        monkeypatch.setattr(pipeline, "_postprocessor", postprocess)
+        if reset_fails:
+
+            def fail_reset():
+                raise RuntimeError("reset failed")
+
+            monkeypatch.setattr(pipeline.runtime_handle.assembly.session, "_reset", fail_reset)
+            with pytest.raises(RuntimeError, match="reset failed"):
+                manager.reset("policy")
+            assert pipeline._policy_failure is failure
+            assert not pipeline.runtime_handle.health.ready
+        else:
+            manager.reset("policy")
+            assert pipeline._policy_failure is None
+            assert manager.infer("policy", request).actual_chunk_size == 4
+    finally:
+        manager.close()
+        dependencies.providers.close()

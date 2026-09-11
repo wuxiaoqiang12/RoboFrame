@@ -67,10 +67,13 @@ def resolve_recording_launch(robot_config: dict, *, requested: bool, mode: str) 
 
 
 def _record_cli_command(active_control_mode: str, *, scheduler_enabled: bool = False) -> str:
-    command = f"ros2 run dataset_tools record_cli --ros-args -p control_mode:={active_control_mode}"
-    if scheduler_enabled:
-        command += " -p restart_session_service:=/action_dispatcher/restart_session"
-    return command
+    if not scheduler_enabled:
+        return f"ros2 run dataset_tools record_cli --ros-args -p control_mode:={active_control_mode}"
+    return (
+        "ros2 run dataset_tools record_cli "
+        "--restart-session-service /action_dispatcher/restart_session "
+        f"--ros-args -p control_mode:={active_control_mode}"
+    )
 
 
 def generate_recording_nodes(

@@ -26,6 +26,8 @@ class InferencePipelineManager:
             owned[pipeline.pipeline_id] = pipeline
         self._pipelines = owned
         self._lock = threading.RLock()
+        self._cleanup_lock = threading.RLock()
+        self._unreleased_pipelines = set(owned)
         self._started = False
         self._starting = False
         self._closed = False
@@ -88,6 +90,14 @@ class InferencePipelineManager:
             capture_raw_action=capture_raw_action,
         )
 
+    def submit_frame(self, pipeline_id: str, request: object, *, deadline: datetime | None = None):
+        self._require_started()
+        pipeline = self._pipeline(pipeline_id)
+        submit = getattr(pipeline, "submit_frame", None)
+        if not callable(submit):
+            return None
+        return submit(request, deadline=deadline)
+
     def reset(self, pipeline_id: str, deadline: datetime | None = None) -> None:
         self._require_started()
         self._pipeline(pipeline_id).reset(deadline)
@@ -122,8 +132,6 @@ class InferencePipelineManager:
             self._pipeline(pipeline_id).close()
             return
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
             self._started = False
         errors = self._close_owned_pipelines()
@@ -155,9 +163,15 @@ class InferencePipelineManager:
 
     def _close_owned_pipelines(self) -> tuple[Exception, ...]:
         errors: list[Exception] = []
-        for pipeline in reversed(tuple(self._pipelines.values())):
-            try:
-                pipeline.close()
-            except Exception as exc:
-                errors.append(exc)
+        with self._cleanup_lock:
+            for pipeline in reversed(tuple(self._pipelines.values())):
+                if pipeline.pipeline_id not in self._unreleased_pipelines:
+                    continue
+                try:
+                    pipeline.close()
+                except Exception as exc:
+                    errors.append(exc)
+                    if getattr(exc, "close_pending", False):
+                        continue
+                self._unreleased_pipelines.discard(pipeline.pipeline_id)
         return tuple(errors)

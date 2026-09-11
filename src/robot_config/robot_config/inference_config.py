@@ -38,6 +38,7 @@ _SCHEDULED_PIPELINE_FIELDS = frozenset(
         "hardware_profile_fingerprint",
         "profile_path",
         "public_capacity",
+        "scheduling",
     }
 )
 _LEGACY_PIPELINE_FIELDS = frozenset(
@@ -121,11 +122,16 @@ _SCHEDULER_FIELDS = frozenset(
         "max_error_details_bytes",
         "terminal_session_retention",
         "max_session_records",
+        "global_policy",
+        "priority_zero_deadline_admission",
     }
 )
 _GLOBAL_ENDPOINT_FIELDS = ("readiness", "open_session", "dispatch", "close_session")
 _WORK_CLASSES = ("session_control", "action_generation")
 _PUBLIC_CAPACITY_FIELDS = frozenset({"max_in_flight"})
+_PIPELINE_SCHEDULING_FIELDS = frozenset({"stage_policy", "stages", "frame_base_priority"})
+_STAGE_SCHEDULING_FIELDS = frozenset({"priority_offset", "instance_count"})
+_DEADLINE_ADMISSION_FIELDS = frozenset({"enable", "safety_margin_ms"})
 _COMPATIBILITY_GROUP_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_:./-]{0,126}$")
 # Wire bounds are fixed by the scheduled ROS interfaces; robot_config may only tighten them.
@@ -161,6 +167,32 @@ class InferenceTransportConfig:
 
 
 @dataclass(frozen=True)
+class StageSchedulingConfig:
+    """Scheduled-only policy for one manifest-owned functional stage."""
+
+    stage_id: str
+    priority_offset: int
+    instance_count: int
+
+
+@dataclass(frozen=True)
+class PipelineSchedulingConfig:
+    """Pipeline-local scheduling policy, materialized only when enabled."""
+
+    stage_policy: Literal["sequential", "independent"]
+    stages: Mapping[str, StageSchedulingConfig]
+    frame_base_priority: int
+    max_stage_offset: int
+    max_supported_public_priority: int
+
+
+@dataclass(frozen=True)
+class DeadlineAdmissionConfig:
+    enable: bool
+    safety_margin_ms: int
+
+
+@dataclass(frozen=True)
 class InferencePipelineConfig:
     """Validated configuration and bundle metadata for one pipeline."""
 
@@ -188,6 +220,7 @@ class InferencePipelineConfig:
     runtime_policy_json: str | None = None
     runtime_policy_fingerprint: str | None = None
     profile_compatibility_fingerprint: str | None = None
+    scheduling: PipelineSchedulingConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -241,6 +274,10 @@ class SchedulerConfig:
     max_error_details_bytes: int
     terminal_session_retention_ns: int
     max_session_records: int
+    global_policy: Literal["fifo", "edf"] = "fifo"
+    priority_zero_deadline_admission: DeadlineAdmissionConfig = dataclass_field(
+        default_factory=lambda: DeadlineAdmissionConfig(False, 5)
+    )
 
 
 @dataclass(frozen=True)
@@ -258,6 +295,14 @@ class ControlModeInferenceConfig:
     inference_fallback_chain: tuple[str, ...] = ()
     inference_priority: int = 0
     inference_retry: Mapping[str, int] = dataclass_field(default_factory=lambda: MappingProxyType({}))
+
+
+def _validate_stage_priority_range(
+    stages: Mapping[str, StageSchedulingConfig], frame_base_priority: int, path: str
+) -> None:
+    max_stage_offset = max((stage.priority_offset for stage in stages.values()), default=0)
+    if frame_base_priority + max_stage_offset > 7:
+        raise InferenceConfigError(f"{path}: priorities must fit the Ascend range 0..7")
 
 
 def scheduler_enabled_from_raw_config(robot_config: Mapping[str, Any], control_mode: str) -> bool:
@@ -369,6 +414,36 @@ def parse_inference_config(
                 inference_priority,
                 inference_retry,
             ) = _parse_executor_fields(executor_config, pipelines, f"control_modes.{control_mode}.executor")
+            if (
+                inference_priority == 0
+                and fallback_chain
+                and scheduler.global_policy == "fifo"
+                and not scheduler.priority_zero_deadline_admission.enable
+            ):
+                raise InferenceConfigError(
+                    f"control_modes.{control_mode}.executor.inference_fallback_chain requires "
+                    "global_policy=edf or FIFO priority_zero_deadline_admission.enable=true"
+                )
+            # Any deadline-driven priority-0 routing (EDF ordering or FIFO profile
+            # admission) is a sequential-only contract: independent stages split
+            # one product request across workers, so per-request deadline
+            # ordering cannot be evaluated or honored.
+            if inference_priority == 0 and (
+                scheduler.global_policy == "edf" or scheduler.priority_zero_deadline_admission.enable
+            ):
+                independent = [
+                    pipeline_id
+                    for pipeline_id in (inference_pipeline, *fallback_chain)
+                    if (pipeline := pipelines.get(pipeline_id)) is not None
+                    and pipeline.scheduling is not None
+                    and pipeline.scheduling.stage_policy == "independent"
+                ]
+                if independent:
+                    raise InferenceConfigError(
+                        f"control_modes.{control_mode}.executor.inference_priority=0 with "
+                        f"global_policy={scheduler.global_policy} deadline-driven scheduling cannot "
+                        f"select independent-stage pipelines: {independent}"
+                    )
             _validate_global_endpoint_conflicts(pipelines, scheduler.global_endpoints)
 
     return ControlModeInferenceConfig(
@@ -460,6 +535,7 @@ def _parse_pipeline(
     runtime_policy_json: str | None = None
     runtime_policy_fingerprint: str | None = None
     profile_compatibility_fingerprint: str | None = None
+    scheduling: PipelineSchedulingConfig | None = None
     if scheduler_enabled:
         required_raw = value.get("required", True)
         if not isinstance(required_raw, bool):
@@ -480,6 +556,7 @@ def _parse_pipeline(
         public_capacity = _parse_public_capacity(value.get("public_capacity", {}), pipeline_path)
         _validate_public_capacity_for_pipeline(public_capacity, pipeline_path)
         _validate_scheduled_artifact_integrity(validated_manifest, execution_mode, pipeline_path)
+        scheduling = _parse_pipeline_scheduling(value.get("scheduling", {}), validated_manifest, pipeline_path)
         runtime_policy_json = _build_runtime_policy_json(
             pipeline_id=pipeline_id,
             execution_mode=execution_mode,
@@ -490,6 +567,7 @@ def _parse_pipeline(
             hardware_resource_id=hardware_resource_id,
             hardware_profile_fingerprint=hardware_profile_fingerprint,
             deployment_fingerprint=validated_manifest.fingerprint,
+            scheduling=scheduling,
         )
         runtime_policy_fingerprint = _sha256_hex(runtime_policy_json)
         profile_compatibility_fingerprint = _sha256_hex(
@@ -517,6 +595,65 @@ def _parse_pipeline(
         runtime_policy_json=runtime_policy_json,
         runtime_policy_fingerprint=runtime_policy_fingerprint,
         profile_compatibility_fingerprint=profile_compatibility_fingerprint,
+        scheduling=scheduling,
+    )
+
+
+def _parse_pipeline_scheduling(
+    value: Any,
+    validated_manifest: ValidatedManifest,
+    pipeline_path: str,
+) -> PipelineSchedulingConfig:
+    path = f"{pipeline_path}.scheduling"
+    if not isinstance(value, Mapping):
+        raise InferenceConfigError(f"{path} must be a mapping")
+    _reject_unknown_fields(value, _PIPELINE_SCHEDULING_FIELDS, path)
+    stage_policy = value.get("stage_policy", "sequential")
+    if stage_policy not in {"sequential", "independent"}:
+        raise InferenceConfigError(f"{path}.stage_policy must be 'sequential' or 'independent'")
+    deployment = validated_manifest.deployment
+    if stage_policy == "independent" and (
+        not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend"
+    ):
+        raise InferenceConfigError(f"{pipeline_path}: independent scheduling requires an Ascend deployment")
+    capability = deployment.functional_execution if isinstance(deployment, CompiledDeployment) else None
+    raw_stages = value.get("stages", {})
+    if not isinstance(raw_stages, Mapping):
+        raise InferenceConfigError(f"{path}.stages must be a mapping")
+    if stage_policy == "independent" and capability is None:
+        raise InferenceConfigError(f"{path}: independent policy requires manifest functional_execution capability")
+    declared_execution = tuple(getattr(deployment, "execution", ()))
+    known_stages = set(declared_execution or ("policy",))
+    if set(raw_stages) - known_stages:
+        raise InferenceConfigError(f"{path}.stages contains unknown stages: {sorted(set(raw_stages) - known_stages)}")
+
+    stages: dict[str, StageSchedulingConfig] = {}
+    for stage_id in sorted(known_stages):
+        raw = raw_stages.get(stage_id, {})
+        stage_path = f"{path}.stages.{stage_id}"
+        if not isinstance(raw, Mapping):
+            raise InferenceConfigError(f"{stage_path} must be a mapping")
+        if "trigger" in raw:
+            raise InferenceConfigError(f"{stage_path} contains unsupported fields: ['trigger']")
+        _reject_unknown_fields(raw, _STAGE_SCHEDULING_FIELDS, stage_path)
+        offset = _require_nonneg_int(raw.get("priority_offset", 0), f"{stage_path}.priority_offset")
+        if stage_policy == "sequential" and offset:
+            raise InferenceConfigError(f"{stage_path}.priority_offset requires independent scheduling")
+        instance_count = _require_pos_int(raw.get("instance_count", 1), f"{stage_path}.instance_count")
+        if instance_count != 1:
+            raise InferenceConfigError(
+                f"{stage_path}.instance_count must be 1: one stage artifact owns one serial runtime instance"
+            )
+        stages[stage_id] = StageSchedulingConfig(stage_id, offset, instance_count)
+    frame_base_priority = _require_nonneg_int(value.get("frame_base_priority", 0), f"{path}.frame_base_priority")
+    max_offset = max((stage.priority_offset for stage in stages.values()), default=0)
+    _validate_stage_priority_range(stages, frame_base_priority, path)
+    return PipelineSchedulingConfig(
+        stage_policy,
+        MappingProxyType(stages),
+        frame_base_priority,
+        max_offset,
+        7 - max_offset,
     )
 
 
@@ -887,6 +1024,7 @@ def _build_runtime_policy_json(
     hardware_resource_id: str,
     hardware_profile_fingerprint: str,
     deployment_fingerprint: str,
+    scheduling: PipelineSchedulingConfig,
 ) -> str:
     """Canonical JSON of the per-pipeline runtime policy, hashed into the fingerprint.
 
@@ -917,6 +1055,17 @@ def _build_runtime_policy_json(
         "deployment_fingerprint": deployment_fingerprint,
         "transport": transport_payload,
         "public_capacity": public_capacity_payload,
+        "scheduling": {
+            "stage_policy": scheduling.stage_policy,
+            "frame_base_priority": scheduling.frame_base_priority,
+            "stages": {
+                stage_id: {
+                    "priority_offset": stage.priority_offset,
+                    "instance_count": stage.instance_count,
+                }
+                for stage_id, stage in sorted(scheduling.stages.items())
+            },
+        },
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -1089,6 +1238,23 @@ def _parse_scheduler(
     max_session_records = _require_pos_int(
         scheduler_value.get("max_session_records", 256), f"{path}.max_session_records"
     )
+    global_policy = scheduler_value.get("global_policy", "fifo")
+    if global_policy not in {"fifo", "edf"}:
+        raise InferenceConfigError(f"{path}.global_policy must be 'fifo' or 'edf'")
+    raw_deadline = scheduler_value.get("priority_zero_deadline_admission", {})
+    if not isinstance(raw_deadline, Mapping):
+        raise InferenceConfigError(f"{path}.priority_zero_deadline_admission must be a mapping")
+    _reject_unknown_fields(raw_deadline, _DEADLINE_ADMISSION_FIELDS, f"{path}.priority_zero_deadline_admission")
+    deadline_enable = raw_deadline.get("enable", False)
+    if not isinstance(deadline_enable, bool):
+        raise InferenceConfigError(f"{path}.priority_zero_deadline_admission.enable must be a boolean")
+    deadline_margin = _require_nonneg_int(
+        raw_deadline.get("safety_margin_ms", 5), f"{path}.priority_zero_deadline_admission.safety_margin_ms"
+    )
+    if global_policy == "edf" and deadline_enable:
+        raise InferenceConfigError(
+            f"{path}: global_policy=edf requires priority-zero deadline admission to be disabled"
+        )
 
     # dispatch_safety_margin_ms must be non-negative and less than the session idle timeout.
     if dispatch_safety_margin_ms >= int(session_idle_timeout * 1000):
@@ -1122,6 +1288,8 @@ def _parse_scheduler(
         max_error_details_bytes=max_error_details_bytes,
         terminal_session_retention_ns=int(terminal_session_retention * _NS_PER_S),
         max_session_records=max_session_records,
+        global_policy=global_policy,
+        priority_zero_deadline_admission=DeadlineAdmissionConfig(deadline_enable, deadline_margin),
     )
 
 

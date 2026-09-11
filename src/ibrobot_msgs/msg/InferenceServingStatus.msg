@@ -22,5 +22,12 @@ string<=64 pipeline_compatibility_fingerprint
 string<=128 configured_hardware_resource_id
 string<=128 runtime_hardware_resource_id
 uint32 hardware_priority_levels
+# Functional scheduling capability. schema_version=1 is the only accepted version.
+uint32 scheduling_capability_schema_version
+string<=16 stage_policy
+uint32 accepted_public_priority_mask
+bool supports_priority_zero_deadline_admission
+int32 max_supported_public_priority
+string<=64 functional_capability_fingerprint
 ibrobot_msgs/InferenceWorkCapacity[<=2] capacities
 ibrobot_msgs/ScheduledInferenceError error

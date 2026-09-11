@@ -9,6 +9,9 @@ There is no compatibility layer for the removed runtime architecture. A backend 
 artifact names, or use environment variables to override artifacts.
 
 Local requests use `ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)` and return `ModelResult`.
+Independent producer frames use `ModelRuntimeHandle.submit_frame(ModelRequest, ExecutionContext)` and return a
+future. They share request registration, cancellation, failure reporting and control draining with ordinary execution.
+Frame admission is bounded separately so a running producer can overlap an admitted Dispatch; diagnostics count both.
 `ModelRuntimeFactory` is a registered construction surface, not the request boundary. A policy reaches the handle
 through its `InferencePipeline` facade. A typed plugin constructs a `ModelSession`, places it in a
 `RuntimeAssembly`, and transfers the assembly to a handle. The handle owns public lifecycle, admission, deadlines,
@@ -149,9 +152,16 @@ The pipeline ID is the stable model-instance and ROS-routing identity. It must m
 `InferencePipeline` is the policy facade that adapts the existing policy contract to `ModelRuntimeHandle` while
 adding LeRobot processors, policy codecs, and action adaptation. The handle owns lifecycle, admission, deadlines,
 cancellation, health, and diagnostics, and loads then releases the components transferred in its `RuntimeAssembly`.
-Compiled models run through a `SequentialModelExecutor` sequence of `InferenceStage` objects; iterative families
+Compiled models run through sequential or staged executors sharing `ComponentModelExecutor` helpers; iterative families
 use `IterativeStage` to invoke roles. One `ExecutionContext` carries the request ID, deadline, and cancellation token
 through every stage and `ModelSession` resource, while the session owns vendor resources shared across those roles.
+Both strategies use `ModelSession.execute_role()` for role validation. Ascend selects isolated datasets internally,
+while reusing semantic binding and diagnostic capture. Functional producer/terminal roles derive from the two entries
+in `deployment.execution`; `functional_execution` declares capabilities without a duplicate `stages` topology.
+The PI0.5 OM converter writes this capability when publishing its standard `vlm` / `action_expert` deployment.
+Republish older bundles through the converter instead of enabling capabilities solely from the model type.
+Independent execution requires Ascend, one instance, and the supported two-stage topology; loading still validates
+device priority-stream support.
 Perception, Echo, TTS, and other typed plugins use the direct
 `ModelServicePlugin -> RuntimeAssembly/ModelRuntimeHandle -> ModelSession resource` composition path.
 
@@ -172,18 +182,31 @@ Default endpoints:
 ### Scheduled Control Plane
 
 `control_modes.<mode>.inference.scheduler.enable` is the only scheduler switch and defaults to `false`. When enabled,
-the launch graph uses Global Open/Dispatch/Close actions and the scheduled action dispatcher; only monolithic
-whole-graph pipelines are supported.
+the launch graph uses Global Open/Dispatch/Close actions and the scheduled action dispatcher. Only monolithic pipelines
+are supported; they use the whole-graph sequential executor by default, while a supported functional manifest may opt
+into independent staged execution.
 
 When the switch is `false`, a complete scheduled configuration may remain in the SSOT as dormant configuration; the
 launch graph, node parameters, endpoints, executor sizing, and backend execution still use the legacy path. When the
 entire `scheduler` block is absent, scheduled fields remain unknown so legacy configurations keep strict typo checking.
 
-Priority `0` is highest and is the only priority that performs deadline admission and tries the request fallback chain.
-The per-pipeline `profile_path` is optional. A missing or invalid profile does not fail readiness or affect non-zero
-priorities; when a priority-0 request actually considers that pipeline, the candidate fails closed and routing continues
-to the next fallback. The request returns `no_feasible_deadline/NOT_STARTED` when no candidate has valid measurements
-and sufficient deadline budget.
+Priority `0` is highest. Its resource ordering and fallback depend on the scheduler policy:
+
+| `global_policy` | `priority_zero_deadline_admission.enable` | Behavior |
+| --- | --- | --- |
+| `fifo` (default) | `false` (default) | Dispatch the target directly without a resource queue; reject nonempty fallback chains |
+| `fifo` | `true` | Profile-based finish admission, per-resource FIFO, and fallback; sequential pipelines only |
+| `edf` | `false` | Per-resource deadline ordering, FIFO ties, and fallback; sequential pipelines only, no profile-based finish prediction |
+
+EDF never preempts active work and does not guarantee completion before the deadline. Deadline-driven priority-0
+(EDF or FIFO profile admission) is a sequential-only contract: independent-stage pipelines split one request across
+overlapping workers, so per-request deadline ordering can be neither evaluated nor honored. robot_config rejects
+such targets and fallback entries at configuration load, and Global skips independent candidates by serving-status
+capability. Unsupported default FIFO/fallback combinations fail configuration loading when the scheduler is enabled.
+Missing or invalid profiles affect
+only FIFO with profile admission enabled, not readiness, EDF, or nonzero priorities. Only `NOT_STARTED` permits fallback;
+`UNKNOWN` remains quarantined and must not be retried. Nonzero priorities dispatch only the target and are exempt from
+the sequential-only constraint.
 
 Offline measurements define a p99 admission SLA rather than an absolute completion guarantee. Action-generation
 profiles must match the pipeline input-contract fingerprint and declare `prompt_bytes_max`; Global selects the smallest

@@ -54,6 +54,7 @@ from inference_manifest import (
     DeploymentTarget,
     DeviceLink,
     ExecutionContract,
+    FunctionalExecutionCapability,
     RoleRuntimeProfile,
     load_inference_manifest,
 )
@@ -440,6 +441,20 @@ def _upsert_pi05_deployment(
         execution=("vlm", "action_expert"),
         bindings={"vlm": vlm_bindings, "action_expert": action_bindings},
         device_links=links,
+        # This publisher owns the supported two-role request-scoped topology.
+        # Isolation and publication guarantees are supplied by the staged runtime;
+        # actual device priority support is checked when the runtime loads.
+        functional_execution=FunctionalExecutionCapability(
+            schema_version=1,
+            supports_async_stage_submission=True,
+            per_model_dataset_isolation=True,
+            per_model_output_isolation=True,
+            atomic_latest_result_publish=True,
+            immutable_result_publish=True,
+            result_version_fence=True,
+            intermediate_buffer_isolation=True,
+            supports_priority_streams=True,
+        ),
     )
     return upsert_deployment(bundle_root, deployment_name, deployment).manifest_path
 

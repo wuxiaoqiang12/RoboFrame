@@ -264,6 +264,21 @@ def test_complete_scheduled_config_needs_only_enable_false_for_legacy_launch(tmp
         assert key not in pipeline_params
 
 
+def test_edf_policy_is_forwarded_to_global_scheduler(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    config_path = tmp_path / "robot.yaml"
+    robot_config = _scheduled_robot_config(config_path, bundle, profile)
+    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"]["global_policy"] = "edf"
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+    scheduler = next(node for node in nodes if node.node_executable == "global_inference_scheduler_node")
+    parameters = _node_parameters(scheduler)
+
+    assert parameters["global_policy"] == "edf"
+    assert parameters["priority_zero_deadline_admission_enabled"] is False
+
+
 def test_scheduler_disabled_matches_63d80599_legacy_launch_contract(tmp_path: Path) -> None:
     """Golden public launch contract captured from the pre-scheduler baseline."""
 

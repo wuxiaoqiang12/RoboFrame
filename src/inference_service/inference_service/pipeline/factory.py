@@ -295,6 +295,8 @@ def create_inference_pipeline(
     model_session_factory=None,
     pi05_diagnostic_schedule: PI05DenoisingSchedule | None = None,
     pi05_diagnostic_schedule_source: str | None = None,
+    stage_policy: str = "sequential",
+    stage_scheduling: Mapping[str, object] | None = None,
 ) -> InferencePipeline:
     """Create one pipeline exclusively from a validated manifest and registry.
 
@@ -353,6 +355,8 @@ def create_inference_pipeline(
             request_timeout=request_timeout,
             default_task=default_task,
             execution_mode=execution_mode,
+            stage_policy=stage_policy,
+            stage_scheduling=stage_scheduling,
         )
     raise BackendLoadError(
         f"v3 identity {context.interface}/{context.model_type}/{context.operation} with backend "
@@ -377,6 +381,8 @@ def create_pipeline_manager(
     model_session_factory=None,
     pi05_diagnostic_schedule: PI05DenoisingSchedule | None = None,
     pi05_diagnostic_schedule_source: str | None = None,
+    stage_policy: str = "sequential",
+    stage_scheduling: Mapping[str, object] | None = None,
 ) -> InferencePipelineManager:
     pipeline = create_inference_pipeline(
         pipeline_id,
@@ -392,6 +398,8 @@ def create_pipeline_manager(
         model_session_factory=model_session_factory,
         pi05_diagnostic_schedule=pi05_diagnostic_schedule,
         pi05_diagnostic_schedule_source=pi05_diagnostic_schedule_source,
+        stage_policy=stage_policy,
+        stage_scheduling=stage_scheduling,
     )
     manager = InferencePipelineManager((pipeline,))
     manager.start()
@@ -1257,25 +1265,23 @@ def register_policy_session_builders(
     for model_type, backend, builder in _POLICY_EXECUTOR_BUILDERS:
         contract = _POLICY_CONTRACTS[model_type]
         visibility = "session" if contract.endswith("iterative") else None
-        key = ModelRuntimeKey(
-            "policy",
-            model_type,
-            "predict",
-            backend,
-            contract,
-            visibility if contract.endswith("iterative") else None,
-        )
-        if assembler_registry.get(key) is not None:
-            continue
-        profile_type = _POLICY_PROFILE_TYPES[backend]
-        assembler_registry.register(
-            RuntimeDescriptor(
-                key=key,
-                session_builder_key=SessionBuilderKey("policy", model_type, "predict", backend),
-                profile_type=profile_type,
-                assembler=_policy_runtime_assembler(builder, contract),
-                execution_contract=contract,
-                declared_capabilities={"stateful": False, "execution_contract": contract},
-                supported_target_runtimes=_POLICY_TARGET_RUNTIMES[backend],
+        contracts = [(contract, visibility)]
+        # Compiled family loops are driven by IterativeStage. Keep the existing
+        # direct registration for deployments that already select that contract.
+        if model_type in {"pi05", "smolvla"} and backend != "torch":
+            contracts.append(("request-iterative", "executor"))
+        for contract, visibility in contracts:
+            key = ModelRuntimeKey("policy", model_type, "predict", backend, contract, visibility)
+            if assembler_registry.get(key) is not None:
+                continue
+            assembler_registry.register(
+                RuntimeDescriptor(
+                    key=key,
+                    session_builder_key=SessionBuilderKey("policy", model_type, "predict", backend),
+                    profile_type=_POLICY_PROFILE_TYPES[backend],
+                    assembler=_policy_runtime_assembler(builder, contract),
+                    execution_contract=contract,
+                    declared_capabilities={"stateful": False, "execution_contract": contract},
+                    supported_target_runtimes=_POLICY_TARGET_RUNTIMES[backend],
+                )
             )
-        )
